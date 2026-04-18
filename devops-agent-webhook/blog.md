@@ -263,7 +263,7 @@ Resources:
   AlarmWebhookLambda:
     Type: AWS::Lambda::Function
     Properties:
-      Runtime: nodejs18.x
+      Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt AlarmWebhookLambdaRole.Arn
       Timeout: 30
