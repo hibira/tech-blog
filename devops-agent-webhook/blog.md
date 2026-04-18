@@ -228,7 +228,6 @@ Resources:
   AlarmWebhookLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${AWS::StackName}-alarm-webhook-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -264,7 +263,6 @@ Resources:
   AlarmWebhookLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub "${AWS::StackName}-alarm-webhook"
       Runtime: nodejs18.x
       Handler: index.handler
       Role: !GetAtt AlarmWebhookLambdaRole.Arn
@@ -564,7 +562,6 @@ Resources:
   AlarmStateChangeRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub "${AWS::StackName}-cw-alarm-state-change"
       Description: Triggers Lambda on CloudWatch Alarm state changes (ALARM; OK handled by Lambda parameter)
       EventPattern:
         source:
