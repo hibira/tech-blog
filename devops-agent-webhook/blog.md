@@ -14,7 +14,7 @@
 
 - CloudWatch → EventBridge → Lambda → DevOps Agent Webhook の連携アーキテクチャ
 - HMAC-SHA256 による Webhook 署名の実装方法
-- タグベースのフィルタリングと優先度マッピング
+- タグベースのフィルタリングと優先度指定
 - CloudFormation によるワンクリックデプロイ手順
 
 ## 全体アーキテクチャ
@@ -123,7 +123,7 @@ aws cloudwatch put-metric-alarm \
   --alarm-description "このアラームはWebサーバー(EC2 i-0abc123)のCPU使用率を監視しています。
 CPU高騰時はまずデプロイ履歴を確認してください。
 直近のデプロイが原因の場合はロールバックを検討。
-関連ログ: /var/log/nginx/error.log, /var/log/app/application.log
+関連ログ: /aws/ecs/my-web-service, /aws/lambda/my-api-handler
 関連ダッシュボード: https://console.aws.amazon.com/cloudwatch/home#dashboards:name=WebServer
 エスカレーション先: #infra-oncall (Slack)" \
   --metric-name CPUUtilization \
@@ -143,7 +143,7 @@ Description に書いておくと効果的な情報の例です。
 |---|---|
 | 監視対象の役割 | 「決済処理を担当する ECS サービス」 |
 | 調査の初手 | 「まず直近のデプロイ履歴を確認」 |
-| 関連するログの場所 | `/var/log/app/application.log` |
+| 関連するログの場所 | CloudWatch Logs ロググループ名（例: `/aws/ecs/my-service`） |
 | 関連ダッシュボードの URL | CloudWatch ダッシュボードへのリンク |
 | 過去の障害パターン | 「月末にバッチ処理と重なって高騰することがある」 |
 | エスカレーション先 | Slack チャンネルや PagerDuty サービス名 |
@@ -927,7 +927,7 @@ const webhookSecret = secretObj.webhookSecret;
 
 - インフラの再デプロイは不要
 - 対象アラームの追加・除外はタグ操作だけで即時反映
-- 環境タグで優先度も自動決定
+- `priority` タグで優先度もアラームごとに指定可能
 
 CloudFormation テンプレートを一度デプロイすれば、あとは運用チームがタグを付け外しするだけで自動調査の範囲をコントロールできます。まずは開発環境のアラームから `auto_investigate=true` を付けて試してみてください。
 
