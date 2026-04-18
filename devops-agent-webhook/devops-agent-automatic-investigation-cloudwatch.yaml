@@ -1,0 +1,421 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudWatch MetricAlarm -> EventBridge -> Lambda -> AWS DevOps Agent Generic Webhook (HMAC).
+  Stores webhook URL + secret in Secrets Manager, enriches alarm details (DescribeAlarms + GetMetricStatistics),
+  filters by alarm tag auto_investigate=true, maps env->priority, signs payload using HMAC-SHA256, and POSTs to webhook.
+  Includes robust fallback logic to derive alarmArn from event.resources[0] or from event.account/event.region + alarmName.
+
+Parameters:
+  SecretName:
+    Type: String
+    Default: devops-agent-webhook
+    Description: Secrets Manager secret name to store webhookUrl and webhookSecret
+  WebhookUrl:
+    Type: String
+    Description: Generic webhook URL (e.g., https://event-ai.us-east-1.api.aws/webhook/generic/...)
+  WebhookSecret:
+    Type: String
+    NoEcho: true
+    Description: Generic webhook secret key (HMAC secret)
+  EnableOkStateNotifications:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: If true, also sends payload when alarm transitions to OK (action=resolved)
+
+Resources:
+  WebhookSecretStore:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Ref SecretName
+      Description: Webhook configuration for AWS DevOps Agent generic webhook (HMAC)
+      SecretString: !Sub |
+        {
+          "webhookUrl": "${WebhookUrl}",
+          "webhookSecret": "${WebhookSecret}"
+        }
+
+  AlarmWebhookLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-alarm-webhook-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AlarmWebhookInlinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref WebhookSecretStore
+              - Sid: CloudWatchReads
+                Effect: Allow
+                Action:
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:ListTagsForResource
+                  - cloudwatch:GetMetricStatistics
+                Resource: "*"
+              - Sid: StsIdentity
+                Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: "*"
+
+  AlarmWebhookLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-alarm-webhook"
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt AlarmWebhookLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref WebhookSecretStore
+          ENABLE_OK: !Ref EnableOkStateNotifications
+      Code:
+        ZipFile: |
+          "use strict";
+
+          const crypto = require("node:crypto");
+
+          const { SecretsManagerClient, GetSecretValueCommand } = require("@aws-sdk/client-secrets-manager");
+          const {
+            CloudWatchClient,
+            ListTagsForResourceCommand,
+            DescribeAlarmsCommand,
+            GetMetricStatisticsCommand
+          } = require("@aws-sdk/client-cloudwatch");
+          const { STSClient, GetCallerIdentityCommand } = require("@aws-sdk/client-sts");
+
+          const secrets = new SecretsManagerClient({});
+          const cw = new CloudWatchClient({});
+          const sts = new STSClient({});
+
+          const SECRET_ARN = process.env.SECRET_ARN;
+          const ENABLE_OK = (process.env.ENABLE_OK || "false").toLowerCase() === "true";
+
+          function tagsToMap(tagsArray) {
+            const out = {};
+            for (const t of tagsArray || []) out[t.Key] = t.Value;
+            return out;
+          }
+
+          function mapPriority(envRaw) {
+            const env = (envRaw || "").toLowerCase();
+            if (env === "prod" || env === "production") return "CRITICAL";
+            if (env === "uat") return "MEDIUM";
+            if (env === "dev") return "LOW";
+            return "LOW";
+          }
+
+          function toIso(d) {
+            try {
+              return d ? new Date(d).toISOString() : null;
+            } catch {
+              return null;
+            }
+          }
+
+          function pickLatestDatapoint(datapoints, statistic, extendedStatistic) {
+            if (!Array.isArray(datapoints) || datapoints.length === 0) return null;
+            const sorted = [...datapoints].sort((a, b) => new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime());
+            const dp = sorted[0];
+
+            if (statistic) {
+              return { timestamp: toIso(dp.Timestamp), value: dp[statistic] ?? null, unit: dp.Unit ?? null };
+            }
+            if (extendedStatistic) {
+              const v = dp.ExtendedStatistics?.[extendedStatistic] ?? null;
+              return { timestamp: toIso(dp.Timestamp), value: v, unit: dp.Unit ?? null, extendedStatistic };
+            }
+            return null;
+          }
+
+          exports.handler = async (event) => {
+            // Expect EventBridge "CloudWatch Alarm State Change" but handle variants robustly
+            const detail = event?.detail || {};
+            const alarmName = detail.alarmName || detail.AlarmName || null;
+
+            // alarmArn can appear in different places depending on source/template
+            let alarmArn = detail.alarmArn || detail.AlarmArn || null;
+
+            // Fallback 1: some events only include the ARN in resources[0]
+            if (!alarmArn && Array.isArray(event?.resources) && event.resources[0]) {
+              alarmArn = event.resources[0];
+            }
+
+            // Fallback 2: reconstruct ARN from event envelope + alarmName
+            if (!alarmArn && alarmName && event?.account && event?.region) {
+              alarmArn = `arn:aws:cloudwatch:${event.region}:${event.account}:alarm:${alarmName}`;
+            }
+
+            const stateValue = detail?.state?.value || detail?.StateValue || "ALARM";
+            const previousStateValue = detail?.previousState?.value || null;
+
+            // Only send on ALARM; optionally also on OK
+            if (stateValue === "OK" && !ENABLE_OK) {
+              console.log("OK state ignored (ENABLE_OK=false).");
+              return { skipped: true, reason: "ok_state_ignored" };
+            }
+            if (stateValue !== "ALARM" && stateValue !== "OK") {
+              console.log("Non-ALARM/OK state ignored:", stateValue);
+              return { skipped: true, reason: "state_not_supported", stateValue };
+            }
+
+            if (!alarmArn || !alarmName) {
+              console.log("Missing alarmArn/alarmName; skipping.", { alarmArn, alarmName });
+              return { skipped: true, reason: "missing_alarm_identity" };
+            }
+
+            // Load webhook config from Secrets Manager
+            const sec = await secrets.send(new GetSecretValueCommand({ SecretId: SECRET_ARN }));
+            const secretObj = JSON.parse(sec.SecretString || "{}");
+            const webhookUrl = secretObj.webhookUrl;
+            const webhookSecret = secretObj.webhookSecret;
+
+            if (!webhookUrl || !webhookSecret) {
+              throw new Error("Secret is missing webhookUrl or webhookSecret");
+            }
+            if (!/^https?:\/\//.test(webhookUrl)) {
+              throw new Error("Invalid webhookUrl in secret (must start with http/https).");
+            }
+
+            // Read alarm tags to filter + set priority
+            const tagResp = await cw.send(new ListTagsForResourceCommand({ ResourceARN: alarmArn }));
+            const tags = tagsToMap(tagResp.Tags);
+
+            const autoInvestigate = (tags.auto_investigate || "").toLowerCase() === "true";
+            if (!autoInvestigate) {
+              console.log("Skipping alarm (auto_investigate tag not true).", { alarmName, tags });
+              return { skipped: true, reason: "auto_investigate_not_true" };
+            }
+
+            const env = tags.env || tags.environment || "";
+            const priority = mapPriority(env);
+
+            // Read alarm definition (standard metric alarm)
+            const describe = await cw.send(new DescribeAlarmsCommand({ AlarmNames: [alarmName] }));
+            const alarm = (describe.MetricAlarms || [])[0];
+            if (!alarm) {
+              console.log("DescribeAlarms returned no MetricAlarms for:", alarmName);
+              return { skipped: true, reason: "alarm_not_found_or_no_access" };
+            }
+
+            // Account info
+            const ident = await sts.send(new GetCallerIdentityCommand({}));
+            const accountId = ident.Account || "unknown";
+
+            // Metric stats for latest datapoint (best effort)
+            const namespace = alarm.Namespace;
+            const metricName = alarm.MetricName;
+            const period = alarm.Period || 60;
+            const statistic = alarm.Statistic; // Average/Sum/Maximum/Minimum/SampleCount
+            const extendedStatistic = alarm.ExtendedStatistic; // pNN.NN
+            const unit = alarm.Unit;
+
+            const evalPeriods = alarm.EvaluationPeriods || 1;
+            const bufferPeriods = Math.max(evalPeriods + 5, 10);
+
+            const endTime = event?.time ? new Date(event.time) : new Date();
+            const startTime = new Date(endTime.getTime() - bufferPeriods * period * 1000);
+
+            let datapoints = [];
+            let latest = null;
+
+            try {
+              const req = {
+                Namespace: namespace,
+                MetricName: metricName,
+                Dimensions: alarm.Dimensions || [],
+                StartTime: startTime,
+                EndTime: endTime,
+                Period: period,
+              };
+              if (statistic) req.Statistics = [statistic];
+              if (extendedStatistic) req.ExtendedStatistics = [extendedStatistic];
+              if (unit) req.Unit = unit;
+
+              const stats = await cw.send(new GetMetricStatisticsCommand(req));
+              datapoints = stats.Datapoints || [];
+              latest = pickLatestDatapoint(datapoints, statistic, extendedStatistic);
+            } catch (e) {
+              console.log("GetMetricStatistics failed (continuing without observed values):", e?.message || e);
+            }
+
+            const stateReason = detail?.state?.reason || detail?.StateReason || "";
+            const stateReasonData = detail?.state?.reasonData || null;
+            const stateTime = event?.time ? new Date(event.time).toISOString() : new Date().toISOString();
+
+            const action = stateValue === "ALARM" ? "created" : "resolved";
+            const incidentId = `cw-${alarmName}-${Date.now()}`;
+
+            const alarmRegion = event.region || process.env.AWS_REGION;
+            const alarmDesc = alarm.AlarmDescription || "";
+
+            // Build rich title and description so DevOps Agent has key context upfront
+            const title = `${stateValue}: ${alarmName} (${alarmRegion})`;
+
+            const descParts = [
+              `Region: ${alarmRegion}`,
+              `Account: ${accountId}`,
+              `AlarmArn: ${alarmArn}`,
+              `Namespace: ${namespace}`,
+              `MetricName: ${metricName}`,
+              `Threshold: ${alarm.ComparisonOperator} ${alarm.Threshold} (${statistic || extendedStatistic || "N/A"})`,
+              `EvaluationPeriods: ${alarm.EvaluationPeriods}, Period: ${period}s`,
+            ];
+            if (alarmDesc) descParts.push(`AlarmDescription: ${alarmDesc}`);
+            if (latest) descParts.push(`LatestValue: ${latest.value} (${latest.timestamp})`);
+            descParts.push(`StateReason: ${stateReason}`);
+            const description = descParts.join("\n");
+
+            // Build payload (alarm-notification style + full context)
+            const payload = {
+              eventType: "incident",
+              incidentId,
+              action,
+              priority,
+              title,
+              description,
+              timestamp: new Date().toISOString(),
+              service: "CloudWatch",
+              data: {
+                metadata: {
+                  region: alarmRegion,
+                  environment: env || "unknown",
+                  accountId,
+                },
+                tags,
+                cloudwatch: {
+                  stateChange: {
+                    alarmName,
+                    alarmArn,
+                    stateValue,
+                    previousStateValue,
+                    stateUpdatedTimestamp: stateTime,
+                    reason: stateReason,
+                    reasonData: stateReasonData,
+                  },
+                  alarm: {
+                    alarmDescription: alarm.AlarmDescription,
+                    actionsEnabled: alarm.ActionsEnabled,
+                    alarmActions: alarm.AlarmActions,
+                    okActions: alarm.OKActions,
+                    insufficientDataActions: alarm.InsufficientDataActions,
+                    comparisonOperator: alarm.ComparisonOperator,
+                    threshold: alarm.Threshold,
+                    evaluationPeriods: alarm.EvaluationPeriods,
+                    datapointsToAlarm: alarm.DatapointsToAlarm,
+                    treatMissingData: alarm.TreatMissingData,
+                    unit: alarm.Unit,
+                    period: alarm.Period,
+                    statistic: alarm.Statistic,
+                    extendedStatistic: alarm.ExtendedStatistic,
+                    namespace: alarm.Namespace,
+                    metricName: alarm.MetricName,
+                    dimensions: alarm.Dimensions,
+                  },
+                  metric: {
+                    namespace,
+                    metricName,
+                    statistic: statistic || null,
+                    extendedStatistic: extendedStatistic || null,
+                    period,
+                    unit: unit || null,
+                    dimensions: alarm.Dimensions || [],
+                  },
+                  observed: {
+                    queryWindow: {
+                      start: startTime.toISOString(),
+                      end: endTime.toISOString(),
+                      periodSeconds: period,
+                    },
+                    latest,
+                    series: (datapoints || [])
+                      .map((dp) => ({
+                        timestamp: toIso(dp.Timestamp),
+                        unit: dp.Unit ?? null,
+                        average: dp.Average,
+                        sum: dp.Sum,
+                        minimum: dp.Minimum,
+                        maximum: dp.Maximum,
+                        sampleCount: dp.SampleCount,
+                        extended: dp.ExtendedStatistics,
+                      }))
+                      .filter((x) => x.timestamp)
+                      .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()),
+                  },
+                  rawEventBridgeDetail: detail,
+                },
+              },
+            };
+
+            // IMPORTANT: signature timestamp must match header and signing input
+            const sigTimestamp = new Date().toISOString();
+            const body = JSON.stringify(payload);
+
+            const hmac = crypto.createHmac("sha256", webhookSecret);
+            hmac.update(`${sigTimestamp}:${body}`, "utf8");
+            const signature = hmac.digest("base64");
+
+            // Node.js 18 Lambda has global fetch
+            const resp = await fetch(webhookUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "x-amzn-event-timestamp": sigTimestamp,
+                "x-amzn-event-signature": signature,
+              },
+              body,
+            });
+
+            const respText = await resp.text();
+            console.log("Webhook response:", resp.status, respText);
+            return { ok: resp.ok, statusCode: resp.status, body: respText };
+          };
+
+  AlarmStateChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-cw-alarm-state-change"
+      Description: Triggers Lambda on CloudWatch Alarm state changes (ALARM; OK handled by Lambda parameter)
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AlarmWebhookLambda.Arn
+          Id: AlarmWebhookLambdaTarget
+
+  AllowEventBridgeInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlarmWebhookLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AlarmStateChangeRule.Arn
+
+Outputs:
+  SecretArn:
+    Description: ARN of the Secrets Manager secret containing webhookUrl + webhookSecret
+    Value: !Ref WebhookSecretStore
+  LambdaArn:
+    Description: Alarm webhook sender Lambda ARN
+    Value: !GetAtt AlarmWebhookLambda.Arn
+  EventRuleArn:
+    Description: EventBridge rule ARN for alarm state changes
+    Value: !GetAtt AlarmStateChangeRule.Arn
