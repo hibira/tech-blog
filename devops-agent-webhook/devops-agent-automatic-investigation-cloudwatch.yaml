@@ -112,12 +112,11 @@ Resources:
             return out;
           }
 
-          function mapPriority(envRaw) {
-            const env = (envRaw || "").toLowerCase();
-            if (env === "prod" || env === "production") return "CRITICAL";
-            if (env === "uat") return "MEDIUM";
-            if (env === "dev") return "LOW";
-            return "LOW";
+          const VALID_PRIORITIES = new Set(["CRITICAL", "HIGH", "MEDIUM", "LOW", "MINIMAL"]);
+
+          function resolvePriority(raw) {
+            const v = (raw || "").toUpperCase();
+            return VALID_PRIORITIES.has(v) ? v : "MEDIUM";
           }
 
           function toIso(d) {
@@ -202,8 +201,7 @@ Resources:
               return { skipped: true, reason: "auto_investigate_not_true" };
             }
 
-            const env = tags.env || tags.environment || "";
-            const priority = mapPriority(env);
+            const priority = resolvePriority(tags.priority);
 
             // Read alarm definition (standard metric alarm)
             const describe = await cw.send(new DescribeAlarmsCommand({ AlarmNames: [alarmName] }));
@@ -294,7 +292,7 @@ Resources:
               data: {
                 metadata: {
                   region: alarmRegion,
-                  environment: env || "unknown",
+                  environment: tags.env || tags.environment || "unknown",
                   accountId,
                 },
                 tags,
